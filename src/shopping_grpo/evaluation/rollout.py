@@ -280,7 +280,26 @@ def collect_for_task(
     tools=None,
     attempt_index=0,
 ):
-    """执行一个任务并返回完整轨迹；所有异常都会被写入轨迹后再释放环境。"""
+    """运行一次 Teacher 与 ShopSimulator 的闭环交互，并返回可回放的原始轨迹。
+
+    函数以一个 task_id 和 attempt_index 标识本次采样：先 reset 环境得到用户需求和初始 observation，再让 Teacher 每轮生成一个工具调用。
+    调用只有通过当前页面的动作守卫后才会进入环境；环境返回的新 observation 会作为 tool message 追加到下一轮上下文。函数只采集轨迹，不负责写入 JSONL，也不判断轨迹是否能进入 SFT。
+
+    Args:
+        task: 当前任务记录，必须能够解析出 task_id；如果包含 prompt，则以它作为初始消息并补齐缺失的 system prompt。
+        client: Teacher 客户端，负责根据 messages 和工具 schema 生成下一轮 assistant 消息，并可选地统计上下文或裁剪 observation。
+        env_factory: ShopSimulator 客户端工厂，必须接受 base_url，并提供 reset、step 和 release 接口。
+        base_url: ShopSimulator 结构化 API 地址。
+        max_steps: 最多允许执行的环境动作数；被本地守卫拒绝的调用不会消耗该计数。
+        tools: 可选工具 schema；未提供时使用项目固定的 SHOP_TOOL_SCHEMAS。
+        attempt_index: 同一 task_id 的采样序号，用于断点续跑和区分多次 rollout。
+
+    Returns:
+        包含初始状态、完整 messages、实际执行 steps、被拒绝调用、终局 reward、状态和异常信息的 trajectory。环境返回 done 只表示 episode 结束，是否满足 SFT 接收条件由后续 acceptance 逻辑判断。
+
+    无论正常结束、模型提前输出文本、达到限制还是执行异常，只要环境客户端已经创建，函数都会在 finally 中尝试释放环境租约；释放失败会覆盖 status 为 environment_release_failed，避免外层继续使用可能被污染的环境池。
+    """
+    # 1. 先建立固定结构的轨迹容器，使正常、失败和中断样本都能由同一套下游逻辑审计。
     trajectory = {
         "trajectory_id": str(uuid4()),
         "task_id": int(task["task_id"]),
@@ -300,9 +319,11 @@ def collect_for_task(
         "error": None,
         "release_error": None,
     }
+
+    # 2. 为本次 attempt 获取独立环境客户端；后续 finally 负责归还它持有的环境租约。
     env = env_factory(base_url=base_url)
     try:
-        # reset 建立任务状态；后续每一轮只允许一个工具调用。
+        # 3. reset 建立任务状态，并将结构化初始页面渲染成动作守卫能够检查的 observation。
         initial = env.reset(task["task_id"])
         if initial.get("observation_state") is not None:
             latest_observation = render_structured_observation(
@@ -319,8 +340,9 @@ def collect_for_task(
         consecutive_blocked_calls = 0
         latest_observation_truncated = False
 
+        # 4. 重复“Teacher 决策 → 本地守卫 → 环境执行 → Observation 回填”，直到环境终止或达到限制。
         while len(trajectory["steps"]) < int(max_steps):
-            # 先请求模型，再校验动作；工具结果会追加到 messages，成为下一轮上下文。
+            # 4.1 Teacher 根据累计 messages 和固定工具 schema 生成当前回合动作，同时记录上下文预算事件。
             assistant = client.complete(messages, tool_schemas)
             context_tokens = getattr(client, "last_context_tokens", None)
             if context_tokens is not None:
@@ -338,6 +360,8 @@ def collect_for_task(
                         **context_event,
                     }
                 )
+
+            # 4.2 每轮只保留第一个工具调用，防止多个动作基于同一份旧 observation 连续执行。
             assistant, dropped_tool_calls = _enforce_serial_tool_call(assistant)
             if dropped_tool_calls:
                 trajectory["tool_call_truncations"].append(
@@ -348,11 +372,15 @@ def collect_for_task(
                     }
                 )
             tool_calls = assistant.get("tool_calls") or []
+
+            # Teacher 未调用工具而直接结束回复时，环境没有产生终局结果；保留该回复供后续拒绝原因审计。
             if not tool_calls:
                 messages.append(assistant)
                 trajectory["status"] = "assistant_final"
                 break
             tool_call = tool_calls[0]
+
+            # 4.3 动作守卫只依据最新可见页面判断合法性；拒绝调用不会触碰环境，也不消耗 max_steps。
             try:
                 name, arguments = _tool_call_name_args(tool_call)
                 reason = action_reject_reason(
@@ -383,9 +411,12 @@ def collect_for_task(
                 trajectory["status"] = "max_steps"
                 return trajectory
             messages.append(assistant)
-            # 只有通过当前 observation 守卫的调用才会触碰环境并消耗一个执行步骤。
+
+            # 4.4 将合法工具调用翻译为 ShopSimulator action 并执行；只有此处产生的动作才计入 steps。
             step = _execute_tool_call(env, tool_call, len(trajectory["steps"]))
             raw_observation = step["observation"]
+
+            # 4.5 如果 Teacher 配置了 observation 预算，则保存原文并把裁剪后的可见版本送入后续上下文。
             projector = getattr(client, "project_observation", None)
             if projector is not None:
                 visible_observation, projection = projector(
@@ -397,6 +428,8 @@ def collect_for_task(
                     step["raw_observation"] = raw_observation
                     step["observation"] = visible_observation
                     step["projection"] = projection
+
+            # 4.6 固化本次环境转移，并将 tool message 追加到 messages，作为 Teacher 下一轮决策依据。
             trajectory["steps"].append(step)
             consecutive_blocked_calls = 0
             latest_observation = step["observation"]
@@ -404,16 +437,22 @@ def collect_for_task(
                 (step.get("projection") or {}).get("truncated")
             )
             messages.append(_tool_message(tool_call, step))
+
+            # 4.7 环境 done 时记录真实终局和 reward；done 只表示 episode 结束，不等同于严格成功。
             if step["done"]:
                 trajectory["status"] = "done"
                 trajectory["terminal_result"] = step["result"]
                 trajectory["final_reward"] = step["reward"]
                 trajectory["done"] = True
                 return trajectory
+
+        # 5. 非终局退出仍保留最后一步 reward，便于后续区分模型提前结束、动作限制和步数耗尽。
         else:
             trajectory["status"] = "max_steps"
         if trajectory["steps"]:
             trajectory["final_reward"] = trajectory["steps"][-1]["reward"]
+
+    # 6. 将环境执行异常和其他异常规范化进轨迹，而不是丢失已经完成的交互证据。
     except ToolExecutionError as exc:
         trajectory["steps"].append(exc.step)
         trajectory["status"] = "error"
@@ -429,6 +468,8 @@ def collect_for_task(
             "message": str(exc),
             "traceback": traceback.format_exc(),
         }
+
+    # 7. 所有已创建环境都必须释放；租约释放失败属于基础设施错误，外层采集器会据此停止继续调度。
     finally:
         try:
             env.release()
